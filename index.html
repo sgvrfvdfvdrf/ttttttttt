@@ -120,8 +120,17 @@
         });
         peer.on('error', (err) => { appendSystemMessage("خطا: " + err.type); });
 
+        // اگه اتصال به سرور سیگنالینگ (نه اتصال به دوست) قطع بشه، خودکار تلاش کن دوباره وصل بشه
+        peer.on('disconnected', () => {
+            connStatus.innerText = "🟡 اتصال به سرور قطع شد، در حال تلاش مجدد...";
+            setTimeout(() => {
+                if (peer && !peer.destroyed) peer.reconnect();
+            }, 1500);
+        });
+
         peer.on('connection', (connection) => {
             conn = connection;
+            lastPeerId = connection.peer;
             connStatus.innerText = "در حال برقراری اتصال با دوستت...";
             setupDataConnection();
         });
@@ -134,13 +143,21 @@
         function connectToPeer() {
             const id = peerIdInput.value.trim();
             if (!id) return;
-            conn = peer.connect(id);
+            lastPeerId = id;
+            conn = peer.connect(id, { reliable: true });
             connStatus.innerText = "در حال برقراری اتصال با دوستت...";
             setupDataConnection();
         }
 
+        let lastPeerId = null;
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_ATTEMPTS = 8;
+
         function setupDataConnection() {
+            if (conn && conn.peer) lastPeerId = conn.peer;
+
             conn.on('open', () => {
+                reconnectAttempts = 0;
                 connStatus.innerText = "اتصال برقرار است ✔";
                 appendSystemMessage("اتصال با موفقیت برقرار شد!");
                 if (isSource && localStream) {
@@ -149,7 +166,10 @@
                 }
             });
             conn.on('error', (err) => { connStatus.innerText = "⚠️ خطا: " + err.message; });
-            conn.on('close', () => { connStatus.innerText = "❌ اتصال قطع شد."; });
+            conn.on('close', () => {
+                connStatus.innerText = "❌ اتصال قطع شد. در حال تلاش برای اتصال مجدد...";
+                attemptDataReconnect();
+            });
             conn.on('data', (data) => {
                 if (data.type === 'chat') {
                     appendMessage("دوستت: " + data.text);
@@ -160,9 +180,36 @@
                         remoteDuration = data.duration;
                         updateTimeLabelFromRemote(data.time, data.duration);
                     }
+                } else if (data.type === 'ping') {
+                    conn.send({ type: 'pong' });
                 }
             });
         }
+
+        // تلاش خودکار برای وصل شدن دوباره به دوست، اگه اتصال قطع بشه
+        function attemptDataReconnect() {
+            if (!lastPeerId || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                    connStatus.innerText = "❌ اتصال قطع شد. لطفاً دوباره دستی وصل شو.";
+                }
+                return;
+            }
+            reconnectAttempts++;
+            const delay = Math.min(1000 * reconnectAttempts, 8000); // تأخیر فزاینده
+            setTimeout(() => {
+                if (!peer || peer.destroyed) return;
+                connStatus.innerText = `🟡 تلاش ${reconnectAttempts} برای اتصال مجدد...`;
+                conn = peer.connect(lastPeerId, { reliable: true });
+                setupDataConnection();
+            }, delay);
+        }
+
+        // بررسی دوره‌ای سلامت اتصال (ping/pong) تا قطعی‌های بی‌صدا زودتر تشخیص داده بشن
+        setInterval(() => {
+            if (conn && conn.open) {
+                try { conn.send({ type: 'ping' }); } catch (e) {}
+            }
+        }, 15000);
 
         function sendMessage() {
             const text = messageInput.value.trim();
@@ -190,7 +237,8 @@
 
             video.onloadeddata = () => {
                 try {
-                    const videoStream = video.captureStream ? video.captureStream(30) : video.mozCaptureStream(30);
+                    // نرخ فریم ۲۰ به‌جای ۳۰: تعادل خوب بین روانی و پایداری روی اینترنت‌های ضعیف‌تر
+                    const videoStream = video.captureStream ? video.captureStream(20) : video.mozCaptureStream(20);
                     if (videoStream) { localStream = videoStream; }
 
                     if (localStream && (peerIdInput.value.trim() || (conn && conn.open))) {
@@ -230,6 +278,8 @@
 
         function handleIncomingOrOutgoingCall(call, isOutgoing, outgoingStream) {
             videoConnStatus.innerText = "🟡 در حال برقراری اتصال ویدیویی...";
+            let videoReconnectAttempts = 0;
+            const MAX_VIDEO_RECONNECT = 6;
 
             call.on('stream', (remoteStream) => {
                 if (isSource) return;
@@ -247,10 +297,40 @@
 
             const pc = call.peerConnection;
             if (pc) {
+                // محدود کردن حداکثر بیت‌ریت ویدیو، تا روی اینترنت ضعیف به‌جای قطع/لگ زیاد،
+                // خودش کیفیت رو پایین نگه داره و پایدار بمونه
+                if (isOutgoing) {
+                    pc.addEventListener('signalingstatechange', () => {
+                        if (pc.signalingState !== 'stable') return;
+                        const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+                        if (sender) {
+                            const params = sender.getParameters();
+                            if (!params.encodings) params.encodings = [{}];
+                            params.encodings[0].maxBitrate = 900000; // ~900kbps سقف کیفیت ویدیو
+                            sender.setParameters(params).catch(() => {});
+                        }
+                    });
+                }
+
                 pc.oniceconnectionstatechange = () => {
                     const state = pc.iceConnectionState;
-                    if (state === 'connected' || state === 'completed') videoConnStatus.innerText = "🟢 اتصال ویدیویی برقرار است.";
-                    else if (state === 'failed' || state === 'disconnected') videoConnStatus.innerText = "🔴 اتصال ویدیویی ضعیف است یا قطع شد.";
+                    if (state === 'connected' || state === 'completed') {
+                        videoConnStatus.innerText = "🟢 اتصال ویدیویی برقرار است.";
+                        videoReconnectAttempts = 0;
+                    } else if (state === 'failed' || state === 'disconnected') {
+                        videoConnStatus.innerText = "🟡 اتصال ویدیویی ضعیف شد، در حال تلاش برای وصل مجدد...";
+                        if (isOutgoing && outgoingStream && videoReconnectAttempts < MAX_VIDEO_RECONNECT) {
+                            videoReconnectAttempts++;
+                            const delay = Math.min(1000 * videoReconnectAttempts, 6000);
+                            setTimeout(() => {
+                                if (!conn || !conn.open) return; // اگه کلاً اتصال دیتا هم قطعه، صبر کن reconnect چت اول انجام بشه
+                                const retryCall = peer.call(call.peer, outgoingStream);
+                                handleIncomingOrOutgoingCall(retryCall, true, outgoingStream);
+                            }, delay);
+                        } else if (videoReconnectAttempts >= MAX_VIDEO_RECONNECT) {
+                            videoConnStatus.innerText = "🔴 اتصال ویدیویی برقرار نشد. اینترنت یکی از دو نفر خیلی ضعیفه یا شبکه محدودیت داره.";
+                        }
+                    }
                 };
             }
         }
